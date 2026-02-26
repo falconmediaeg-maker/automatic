@@ -154,8 +154,11 @@ async function doVote(url: string, proxyUrl: string, answerKey: string, rep: num
     return false;
   }
 
-  const tokenMatch = getResult.body.match(/_token.*?value="([^"]+)"/);
-  const pollIdMatch = getResult.body.match(/gidvnrj.*?value="(\d+)"/);
+const tokenMatch = getResult.body.match(/name="_token"\s+type="hidden"\s+value="([^"]+)"/)
+  || getResult.body.match(/name="_token".*?value="([^"]+)"/);
+
+const pollIdMatch = getResult.body.match(/name="gidvnrj"\s+value="(\d+)"/)
+  || getResult.body.match(/name="gidvnrj".*?value="(\d+)"/);
 
   if (!tokenMatch || !pollIdMatch) {
     storage.addLog(`[${rep}] Could not extract token/poll ID`, "warning", rep);
