@@ -17,12 +17,26 @@ const USER_AGENTS = [
 ];
 
 function buildProxyUrl(raw: string): string {
-  if (!raw?.trim()) return "";
+  if (!raw || !raw.trim()) return "";
+
   const s = raw.trim();
+
+  if (s.toLowerCase() === "rotating") return "";
+
+  if (s.startsWith("http://") || s.startsWith("https://")) {
+    return s;
+  }
+
   const parts = s.split(":");
-  if (parts.length === 4) return `http://${parts[2]}:${parts[3]}@${parts[0]}:${parts[1]}`;
-  if (parts.length === 2) return `http://${parts[0]}:${parts[1]}`;
-  if (s.startsWith("http")) return s;
+
+  if (parts.length === 2) {
+    return `http://${parts[0]}:${parts[1]}`;
+  }
+
+  if (parts.length === 4) {
+    return `http://${parts[2]}:${parts[3]}@${parts[0]}:${parts[1]}`;
+  }
+
   return "";
 }
 
