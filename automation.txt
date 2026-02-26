@@ -1,0 +1,191 @@
+import { storage } from "./storage";
+import type { TaskConfig } from "@shared/schema";
+import { log } from "./index";
+import { execSync } from "child_process";
+
+let shouldStop = false;
+let isRunning = false;
+
+const USER_AGENTS = [
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+];
+
+function buildProxyUrl(raw: string): string {
+  if (!raw?.trim()) return "";
+  const s = raw.trim();
+  const parts = s.split(":");
+  if (parts.length === 4) return `http://${parts[2]}:${parts[3]}@${parts[0]}:${parts[1]}`;
+  if (parts.length === 2) return `http://${parts[0]}:${parts[1]}`;
+  if (s.startsWith("http")) return s;
+  return "";
+}
+
+function randomUA(): string {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function curlGet(url: string, proxyUrl: string, ua: string, cookieFile: string): string {
+  try {
+    const proxyArg = proxyUrl ? `-x "${proxyUrl}"` : "";
+    const cmd = `curl -s -L --max-time 30 ${proxyArg} -c "${cookieFile}" -H "User-Agent: ${ua}" -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" -H "Accept-Language: en-US,en;q=0.9,ar;q=0.8" "${url}" 2>/dev/null`;
+    return execSync(cmd, { encoding: "utf-8", timeout: 35000 });
+  } catch {
+    return "";
+  }
+}
+
+function curlPost(url: string, proxyUrl: string, ua: string, referer: string, origin: string, formData: string, cookieFile: string): string {
+  try {
+    const proxyArg = proxyUrl ? `-x "${proxyUrl}"` : "";
+    const cmd = `curl -s --max-time 30 ${proxyArg} -b "${cookieFile}" -H "User-Agent: ${ua}" -H "Referer: ${referer}" -H "Origin: ${origin}" -H "Content-Type: application/x-www-form-urlencoded" -d '${formData}' -o /dev/null -w "%{http_code}" "${url}" 2>/dev/null`;
+    return execSync(cmd, { encoding: "utf-8", timeout: 35000 }).trim();
+  } catch {
+    return "0";
+  }
+}
+
+async function doVote(url: string, proxyUrl: string, answerKey: string, rep: number, total: number): Promise<boolean> {
+  const ua = randomUA();
+  const cookieFile = `/tmp/vc_${process.pid}_${rep}.txt`;
+  const encodedKey = answerKey.replace("[", "%5B").replace("]", "%5D");
+
+  storage.addLog(`[${rep}/${total}] Voting...`, "info", rep);
+
+  const html = curlGet(url, proxyUrl, ua, cookieFile);
+  if (!html) {
+    storage.addLog(`[${rep}] No response from server`, "warning", rep);
+    try { execSync(`rm -f "${cookieFile}"`, { timeout: 3000 }); } catch {}
+    return false;
+  }
+
+  const tokenMatch = html.match(/_token.*?value="([^"]+)"/);
+  const pollIdMatch = html.match(/gidvnrj.*?value="(\d+)"/);
+
+  if (!tokenMatch || !pollIdMatch) {
+    storage.addLog(`[${rep}] Could not extract token/poll ID`, "warning", rep);
+    try { execSync(`rm -f "${cookieFile}"`, { timeout: 3000 }); } catch {}
+    return false;
+  }
+
+  const token = tokenMatch[1];
+  const pollId = pollIdMatch[1];
+
+  await sleep(300 + Math.random() * 700);
+
+  const origin = url.match(/https?:\/\/[^/]+/)?.[0] || "";
+  const sex = Math.floor(Math.random() * 2) + 1;
+  const age = Math.floor(Math.random() * 5) + 1;
+  const formData = `gidvnrj=${pollId}&sex=${sex}&age=${age}&_token=${token}&${encodedKey}=1`;
+
+  const statusCode = curlPost(`${origin}/pvote`, proxyUrl, ua, url, origin, formData, cookieFile);
+
+  try { execSync(`rm -f "${cookieFile}"`, { timeout: 3000 }); } catch {}
+
+  if (statusCode === "302" || statusCode === "200") {
+    return true;
+  } else {
+    storage.addLog(`[${rep}] HTTP ${statusCode}`, "warning", rep);
+    return false;
+  }
+}
+
+async function voteLoop(config: TaskConfig, answerKey: string, proxyUrl: string): Promise<void> {
+  let successCount = 0;
+  let failCount = 0;
+
+  storage.addLog(`Target: ${config.url}`, "info");
+  storage.addLog(`Answer: ${answerKey}`, "info");
+  if (proxyUrl) storage.addLog("Proxy: rotating", "success");
+
+  for (let i = 1; i <= config.repetitions; i++) {
+    if (shouldStop) {
+      storage.addLog("Stopped by user", "warning");
+      storage.setProgress({ status: "idle", currentRepetition: i - 1 });
+      isRunning = false;
+      return;
+    }
+
+    storage.setProgress({ currentRepetition: i - 1 });
+
+    try {
+      const success = await doVote(config.url, proxyUrl, answerKey, i, config.repetitions);
+      if (success) {
+        successCount++;
+        storage.addLog(`[${i}] SUCCESS (${successCount} total)`, "success", i);
+      } else {
+        failCount++;
+      }
+    } catch (err: any) {
+      failCount++;
+      storage.addLog(`[${i}] Error: ${err.message}`, "error", i);
+    }
+
+    storage.setProgress({ currentRepetition: i });
+
+    if (i < config.repetitions && !shouldStop) {
+      const jitter = Math.floor(Math.random() * 1000);
+      await sleep(config.delayBetweenReps + jitter);
+    }
+  }
+
+  const finalStatus = successCount > 0 ? "completed" : "error";
+  storage.addLog(`Done: ${successCount} success, ${failCount} failed / ${config.repetitions}`, successCount > 0 ? "success" : "error");
+  storage.setProgress({
+    status: finalStatus,
+    currentRepetition: config.repetitions,
+    completedAt: new Date().toISOString(),
+  });
+  isRunning = false;
+}
+
+export async function runTask(config: TaskConfig): Promise<void> {
+  let answerKey = "";
+  for (const a of config.actions) {
+    if (a.type === "click" && a.selector?.includes("answers[")) {
+      const m = a.selector.match(/answers\[(\d+)\]/);
+      if (m) { answerKey = `answers[${m[1]}]`; break; }
+    }
+  }
+
+  if (!answerKey) {
+    storage.addLog("No answer selector found in actions", "error");
+    storage.setProgress({ status: "error", completedAt: new Date().toISOString() });
+    return;
+  }
+
+  const proxyUrl = buildProxyUrl(config.proxyListUrl || "");
+
+  shouldStop = false;
+  isRunning = true;
+
+  storage.resetProgress();
+  storage.setConfig(config);
+  storage.setProgress({
+    status: "running",
+    totalRepetitions: config.repetitions,
+    currentRepetition: 0,
+    startedAt: new Date().toISOString(),
+  });
+  storage.addLog(`Starting ${config.repetitions} votes`, "info");
+
+  log(`Starting ${config.repetitions} votes inline`);
+
+  voteLoop(config, answerKey, proxyUrl).catch((err) => {
+    storage.addLog(`Fatal error: ${err.message}`, "error");
+    storage.setProgress({ status: "error", error: err.message });
+    isRunning = false;
+  });
+}
+
+export async function stopTask(): Promise<void> {
+  shouldStop = true;
+  storage.addLog("Stop requested...", "warning");
+}

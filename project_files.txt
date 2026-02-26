@@ -1,0 +1,1384 @@
+========================================
+FILE: server/index.ts
+========================================
+
+import express, { type Request, Response, NextFunction } from "express";
+import { registerRoutes } from "./routes";
+import { serveStatic } from "./static";
+import { createServer } from "http";
+
+const app = express();
+const httpServer = createServer(app);
+
+declare module "http" {
+  interface IncomingMessage {
+    rawBody: unknown;
+  }
+}
+
+app.use(
+  express.json({
+    verify: (req, _res, buf) => {
+      req.rawBody = buf;
+    },
+  }),
+);
+
+app.use(express.urlencoded({ extended: false }));
+
+export function log(message: string, source = "express") {
+  const formattedTime = new Date().toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true,
+  });
+
+  console.log(`${formattedTime} [${source}] ${message}`);
+}
+
+app.use((req, res, next) => {
+  const start = Date.now();
+  const path = req.path;
+  let capturedJsonResponse: Record<string, any> | undefined = undefined;
+
+  const originalResJson = res.json;
+  res.json = function (bodyJson, ...args) {
+    capturedJsonResponse = bodyJson;
+    return originalResJson.apply(res, [bodyJson, ...args]);
+  };
+
+  res.on("finish", () => {
+    const duration = Date.now() - start;
+    if (path.startsWith("/api")) {
+      let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
+      if (capturedJsonResponse) {
+        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
+      }
+
+      log(logLine);
+    }
+  });
+
+  next();
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err.message, err.stack);
+});
+process.on("unhandledRejection", (reason: any) => {
+  console.error("UNHANDLED REJECTION:", reason?.message || reason, reason?.stack);
+});
+
+(async () => {
+  await registerRoutes(httpServer, app);
+
+  app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
+    const status = err.status || err.statusCode || 500;
+    const message = err.message || "Internal Server Error";
+
+    console.error("Internal Server Error:", err);
+
+    if (res.headersSent) {
+      return next(err);
+    }
+
+    return res.status(status).json({ message });
+  });
+
+  // importantly only setup vite in development and after
+  // setting up all the other routes so the catch-all route
+  // doesn't interfere with the other routes
+  if (process.env.NODE_ENV === "production") {
+    serveStatic(app);
+  } else {
+    const { setupVite } = await import("./vite");
+    await setupVite(httpServer, app);
+  }
+
+  // ALWAYS serve the app on the port specified in the environment variable PORT
+  // Other ports are firewalled. Default to 5000 if not specified.
+  // this serves both the API and the client.
+  // It is the only port that is not firewalled.
+  const port = parseInt(process.env.PORT || "5000", 10);
+  httpServer.listen(
+    {
+      port,
+      host: "0.0.0.0",
+      reusePort: true,
+    },
+    () => {
+      log(`serving on port ${port}`);
+    },
+  );
+})();
+
+========================================
+FILE: server/automation.ts
+========================================
+
+import { storage } from "./storage";
+import type { TaskConfig } from "@shared/schema";
+import { log } from "./index";
+import { execSync } from "child_process";
+
+let shouldStop = false;
+let isRunning = false;
+
+const USER_AGENTS = [
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+];
+
+function buildProxyUrl(raw: string): string {
+  if (!raw?.trim()) return "";
+  const s = raw.trim();
+  const parts = s.split(":");
+  if (parts.length === 4) return `http://${parts[2]}:${parts[3]}@${parts[0]}:${parts[1]}`;
+  if (parts.length === 2) return `http://${parts[0]}:${parts[1]}`;
+  if (s.startsWith("http")) return s;
+  return "";
+}
+
+function randomUA(): string {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function curlGet(url: string, proxyUrl: string, ua: string, cookieFile: string): string {
+  try {
+    const proxyArg = proxyUrl ? `-x "${proxyUrl}"` : "";
+    const cmd = `curl -s -L --max-time 30 ${proxyArg} -c "${cookieFile}" -H "User-Agent: ${ua}" -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" -H "Accept-Language: en-US,en;q=0.9,ar;q=0.8" "${url}" 2>/dev/null`;
+    return execSync(cmd, { encoding: "utf-8", timeout: 35000 });
+  } catch {
+    return "";
+  }
+}
+
+function curlPost(url: string, proxyUrl: string, ua: string, referer: string, origin: string, formData: string, cookieFile: string): string {
+  try {
+    const proxyArg = proxyUrl ? `-x "${proxyUrl}"` : "";
+    const cmd = `curl -s --max-time 30 ${proxyArg} -b "${cookieFile}" -H "User-Agent: ${ua}" -H "Referer: ${referer}" -H "Origin: ${origin}" -H "Content-Type: application/x-www-form-urlencoded" -d '${formData}' -o /dev/null -w "%{http_code}" "${url}" 2>/dev/null`;
+    return execSync(cmd, { encoding: "utf-8", timeout: 35000 }).trim();
+  } catch {
+    return "0";
+  }
+}
+
+async function doVote(url: string, proxyUrl: string, answerKey: string, rep: number, total: number): Promise<boolean> {
+  const ua = randomUA();
+  const cookieFile = `/tmp/vc_${process.pid}_${rep}.txt`;
+  const encodedKey = answerKey.replace("[", "%5B").replace("]", "%5D");
+
+  storage.addLog(`[${rep}/${total}] Voting...`, "info", rep);
+
+  const html = curlGet(url, proxyUrl, ua, cookieFile);
+  if (!html) {
+    storage.addLog(`[${rep}] No response from server`, "warning", rep);
+    try { execSync(`rm -f "${cookieFile}"`, { timeout: 3000 }); } catch {}
+    return false;
+  }
+
+  const tokenMatch = html.match(/_token.*?value="([^"]+)"/);
+  const pollIdMatch = html.match(/gidvnrj.*?value="(\d+)"/);
+
+  if (!tokenMatch || !pollIdMatch) {
+    storage.addLog(`[${rep}] Could not extract token/poll ID`, "warning", rep);
+    try { execSync(`rm -f "${cookieFile}"`, { timeout: 3000 }); } catch {}
+    return false;
+  }
+
+  const token = tokenMatch[1];
+  const pollId = pollIdMatch[1];
+
+  await sleep(300 + Math.random() * 700);
+
+  const origin = url.match(/https?:\/\/[^/]+/)?.[0] || "";
+  const sex = Math.floor(Math.random() * 2) + 1;
+  const age = Math.floor(Math.random() * 5) + 1;
+  const formData = `gidvnrj=${pollId}&sex=${sex}&age=${age}&_token=${token}&${encodedKey}=1`;
+
+  const statusCode = curlPost(`${origin}/pvote`, proxyUrl, ua, url, origin, formData, cookieFile);
+
+  try { execSync(`rm -f "${cookieFile}"`, { timeout: 3000 }); } catch {}
+
+  if (statusCode === "302" || statusCode === "200") {
+    return true;
+  } else {
+    storage.addLog(`[${rep}] HTTP ${statusCode}`, "warning", rep);
+    return false;
+  }
+}
+
+async function voteLoop(config: TaskConfig, answerKey: string, proxyUrl: string): Promise<void> {
+  let successCount = 0;
+  let failCount = 0;
+
+  storage.addLog(`Target: ${config.url}`, "info");
+  storage.addLog(`Answer: ${answerKey}`, "info");
+  if (proxyUrl) storage.addLog("Proxy: rotating", "success");
+
+  for (let i = 1; i <= config.repetitions; i++) {
+    if (shouldStop) {
+      storage.addLog("Stopped by user", "warning");
+      storage.setProgress({ status: "idle", currentRepetition: i - 1 });
+      isRunning = false;
+      return;
+    }
+
+    storage.setProgress({ currentRepetition: i - 1 });
+
+    try {
+      const success = await doVote(config.url, proxyUrl, answerKey, i, config.repetitions);
+      if (success) {
+        successCount++;
+        storage.addLog(`[${i}] SUCCESS (${successCount} total)`, "success", i);
+      } else {
+        failCount++;
+      }
+    } catch (err: any) {
+      failCount++;
+      storage.addLog(`[${i}] Error: ${err.message}`, "error", i);
+    }
+
+    storage.setProgress({ currentRepetition: i });
+
+    if (i < config.repetitions && !shouldStop) {
+      const jitter = Math.floor(Math.random() * 1000);
+      await sleep(config.delayBetweenReps + jitter);
+    }
+  }
+
+  const finalStatus = successCount > 0 ? "completed" : "error";
+  storage.addLog(`Done: ${successCount} success, ${failCount} failed / ${config.repetitions}`, successCount > 0 ? "success" : "error");
+  storage.setProgress({
+    status: finalStatus,
+    currentRepetition: config.repetitions,
+    completedAt: new Date().toISOString(),
+  });
+  isRunning = false;
+}
+
+export async function runTask(config: TaskConfig): Promise<void> {
+  let answerKey = "";
+  for (const a of config.actions) {
+    if (a.type === "click" && a.selector?.includes("answers[")) {
+      const m = a.selector.match(/answers\[(\d+)\]/);
+      if (m) { answerKey = `answers[${m[1]}]`; break; }
+    }
+  }
+
+  if (!answerKey) {
+    storage.addLog("No answer selector found in actions", "error");
+    storage.setProgress({ status: "error", completedAt: new Date().toISOString() });
+    return;
+  }
+
+  const proxyUrl = buildProxyUrl(config.proxyListUrl || "");
+
+  shouldStop = false;
+  isRunning = true;
+
+  storage.resetProgress();
+  storage.setConfig(config);
+  storage.setProgress({
+    status: "running",
+    totalRepetitions: config.repetitions,
+    currentRepetition: 0,
+    startedAt: new Date().toISOString(),
+  });
+  storage.addLog(`Starting ${config.repetitions} votes`, "info");
+
+  log(`Starting ${config.repetitions} votes inline`);
+
+  voteLoop(config, answerKey, proxyUrl).catch((err) => {
+    storage.addLog(`Fatal error: ${err.message}`, "error");
+    storage.setProgress({ status: "error", error: err.message });
+    isRunning = false;
+  });
+}
+
+export async function stopTask(): Promise<void> {
+  shouldStop = true;
+  storage.addLog("Stop requested...", "warning");
+}
+
+========================================
+FILE: server/routes.ts
+========================================
+
+import type { Express } from "express";
+import { createServer, type Server } from "http";
+import { storage } from "./storage";
+import { taskConfigSchema } from "@shared/schema";
+import { runTask, stopTask } from "./automation";
+
+export async function registerRoutes(
+  httpServer: Server,
+  app: Express
+): Promise<Server> {
+  app.post("/api/task/start", async (req, res) => {
+    try {
+      const progress = storage.getProgress();
+      if (progress.status === "running") {
+        return res.status(400).json({ message: "A task is already running" });
+      }
+
+      const parsed = taskConfigSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ message: parsed.error.message });
+      }
+
+      const config = parsed.data;
+      res.json({ message: "Task started", repetitions: config.repetitions });
+
+      setTimeout(() => {
+        runTask(config).catch((err) => {
+          storage.addLog(`Fatal error: ${err.message}`, "error");
+          storage.setProgress({ status: "error", error: err.message });
+        });
+      }, 50);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.post("/api/task/stop", async (_req, res) => {
+    try {
+      await stopTask();
+      res.json({ message: "Task stop requested" });
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.get("/api/task/progress", (_req, res) => {
+    const progress = storage.getProgress();
+    res.json(progress);
+  });
+
+  return httpServer;
+}
+
+========================================
+FILE: server/storage.ts
+========================================
+
+import type { TaskConfig, TaskProgress, TaskLog, TaskStatus } from "@shared/schema";
+import { randomUUID } from "crypto";
+
+export interface IStorage {
+  getProgress(): TaskProgress;
+  setProgress(progress: Partial<TaskProgress>): void;
+  addLog(message: string, type: TaskLog["type"], repetition?: number): void;
+  setLogs(logs: TaskLog[]): void;
+  resetProgress(): void;
+  setConfig(config: TaskConfig | null): void;
+  getConfig(): TaskConfig | null;
+  setShouldStop(val: boolean): void;
+  getShouldStop(): boolean;
+}
+
+export class MemStorage implements IStorage {
+  private progress: TaskProgress = {
+    status: "idle",
+    currentRepetition: 0,
+    totalRepetitions: 0,
+    logs: [],
+  };
+  private config: TaskConfig | null = null;
+  private shouldStop = false;
+
+  getProgress(): TaskProgress {
+    return { ...this.progress, logs: [...this.progress.logs] };
+  }
+
+  setProgress(updates: Partial<TaskProgress>): void {
+    this.progress = { ...this.progress, ...updates };
+  }
+
+  addLog(message: string, type: TaskLog["type"], repetition?: number): void {
+    const log: TaskLog = {
+      id: randomUUID(),
+      timestamp: new Date().toISOString(),
+      message,
+      type,
+      repetition,
+    };
+    this.progress.logs.push(log);
+    if (this.progress.logs.length > 100) {
+      this.progress.logs = this.progress.logs.slice(-50);
+    }
+  }
+
+  setLogs(logs: TaskLog[]): void {
+    this.progress.logs = logs;
+  }
+
+  resetProgress(): void {
+    this.progress = {
+      status: "idle",
+      currentRepetition: 0,
+      totalRepetitions: 0,
+      logs: [],
+    };
+    this.shouldStop = false;
+  }
+
+  setConfig(config: TaskConfig | null): void {
+    this.config = config;
+  }
+
+  getConfig(): TaskConfig | null {
+    return this.config;
+  }
+
+  setShouldStop(val: boolean): void {
+    this.shouldStop = val;
+  }
+
+  getShouldStop(): boolean {
+    return this.shouldStop;
+  }
+}
+
+export const storage = new MemStorage();
+
+========================================
+FILE: shared/schema.ts
+========================================
+
+import { z } from "zod";
+
+export const actionTypes = [
+  "click",
+  "type",
+  "wait",
+  "scroll",
+  "select",
+  "screenshot",
+] as const;
+
+export const actionSchema = z.object({
+  id: z.string(),
+  type: z.enum(actionTypes),
+  selector: z.string().optional(),
+  value: z.string().optional(),
+  description: z.string().optional(),
+});
+
+export const taskConfigSchema = z.object({
+  url: z.string().url("Please enter a valid URL"),
+  actions: z.array(actionSchema).min(1, "Add at least one action"),
+  repetitions: z.number().int().min(1).max(1000),
+  delayBetweenReps: z.number().int().min(0).max(300000).default(1000),
+  proxyListUrl: z.string().optional(),
+});
+
+export type Action = z.infer<typeof actionSchema>;
+export type TaskConfig = z.infer<typeof taskConfigSchema>;
+
+export type TaskStatus = "idle" | "running" | "paused" | "completed" | "error";
+
+export interface TaskLog {
+  id: string;
+  timestamp: string;
+  message: string;
+  type: "info" | "success" | "error" | "warning";
+  repetition?: number;
+}
+
+export interface TaskProgress {
+  status: TaskStatus;
+  currentRepetition: number;
+  totalRepetitions: number;
+  logs: TaskLog[];
+  startedAt?: string;
+  completedAt?: string;
+  error?: string;
+}
+
+export const users = undefined;
+export type InsertUser = never;
+export type User = never;
+
+========================================
+FILE: package.json
+========================================
+
+{
+  "name": "rest-express",
+  "version": "1.0.0",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "dev": "NODE_ENV=development tsx server/index.ts",
+    "build": "tsx script/build.ts",
+    "start": "NODE_ENV=production node dist/index.cjs",
+    "check": "tsc",
+    "db:push": "drizzle-kit push"
+  },
+  "dependencies": {
+    "@hookform/resolvers": "^3.10.0",
+    "@jridgewell/trace-mapping": "^0.3.25",
+    "@radix-ui/react-accordion": "^1.2.4",
+    "@radix-ui/react-alert-dialog": "^1.1.7",
+    "@radix-ui/react-aspect-ratio": "^1.1.3",
+    "@radix-ui/react-avatar": "^1.1.4",
+    "@radix-ui/react-checkbox": "^1.1.5",
+    "@radix-ui/react-collapsible": "^1.1.4",
+    "@radix-ui/react-context-menu": "^2.2.7",
+    "@radix-ui/react-dialog": "^1.1.7",
+    "@radix-ui/react-dropdown-menu": "^2.1.7",
+    "@radix-ui/react-hover-card": "^1.1.7",
+    "@radix-ui/react-label": "^2.1.3",
+    "@radix-ui/react-menubar": "^1.1.7",
+    "@radix-ui/react-navigation-menu": "^1.2.6",
+    "@radix-ui/react-popover": "^1.1.7",
+    "@radix-ui/react-progress": "^1.1.3",
+    "@radix-ui/react-radio-group": "^1.2.4",
+    "@radix-ui/react-scroll-area": "^1.2.4",
+    "@radix-ui/react-select": "^2.1.7",
+    "@radix-ui/react-separator": "^1.1.3",
+    "@radix-ui/react-slider": "^1.2.4",
+    "@radix-ui/react-slot": "^1.2.0",
+    "@radix-ui/react-switch": "^1.1.4",
+    "@radix-ui/react-tabs": "^1.1.4",
+    "@radix-ui/react-toast": "^1.2.7",
+    "@radix-ui/react-toggle": "^1.1.3",
+    "@radix-ui/react-toggle-group": "^1.1.3",
+    "@radix-ui/react-tooltip": "^1.2.0",
+    "@tanstack/react-query": "^5.60.5",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cmdk": "^1.1.1",
+    "connect-pg-simple": "^10.0.0",
+    "date-fns": "^3.6.0",
+    "drizzle-orm": "^0.39.3",
+    "drizzle-zod": "^0.7.0",
+    "embla-carousel-react": "^8.6.0",
+    "express": "^5.0.1",
+    "express-session": "^1.18.1",
+    "framer-motion": "^11.13.1",
+    "https-proxy-agent": "^7.0.6",
+    "input-otp": "^1.4.2",
+    "lucide-react": "^0.453.0",
+    "memorystore": "^1.6.7",
+    "next-themes": "^0.4.6",
+    "passport": "^0.7.0",
+    "passport-local": "^1.0.0",
+    "pg": "^8.16.3",
+    "react": "^18.3.1",
+    "react-day-picker": "^8.10.1",
+    "react-dom": "^18.3.1",
+    "react-hook-form": "^7.55.0",
+    "react-icons": "^5.4.0",
+    "react-resizable-panels": "^2.1.7",
+    "recharts": "^2.15.2",
+    "tailwind-merge": "^2.6.0",
+    "tailwindcss-animate": "^1.0.7",
+    "tw-animate-css": "^1.2.5",
+    "vaul": "^1.1.2",
+    "wouter": "^3.3.5",
+    "ws": "^8.18.0",
+    "zod": "^3.24.2",
+    "zod-validation-error": "^3.4.0"
+  },
+  "devDependencies": {
+    "@replit/vite-plugin-cartographer": "^0.4.4",
+    "@replit/vite-plugin-dev-banner": "^0.1.1",
+    "@replit/vite-plugin-runtime-error-modal": "^0.0.3",
+    "@tailwindcss/typography": "^0.5.15",
+    "@tailwindcss/vite": "^4.1.18",
+    "@types/connect-pg-simple": "^7.0.3",
+    "@types/express": "^5.0.0",
+    "@types/express-session": "^1.18.0",
+    "@types/node": "20.19.27",
+    "@types/passport": "^1.0.16",
+    "@types/passport-local": "^1.0.38",
+    "@types/react": "^18.3.11",
+    "@types/react-dom": "^18.3.1",
+    "@types/ws": "^8.5.13",
+    "@vitejs/plugin-react": "^4.7.0",
+    "autoprefixer": "^10.4.20",
+    "drizzle-kit": "^0.31.8",
+    "esbuild": "^0.25.0",
+    "postcss": "^8.4.47",
+    "tailwindcss": "^3.4.17",
+    "tsx": "^4.20.5",
+    "typescript": "5.6.3",
+    "vite": "^7.3.0"
+  },
+  "overrides": {
+    "drizzle-kit": {
+      "@esbuild-kit/esm-loader": "npm:tsx@^4.20.4"
+    }
+  },
+  "optionalDependencies": {
+    "bufferutil": "^4.0.8"
+  }
+}
+
+========================================
+FILE: postcss.config.js
+========================================
+
+export default {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+}
+
+========================================
+FILE: vite.config.ts
+========================================
+
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import path from "path";
+import runtimeErrorOverlay from "@replit/vite-plugin-runtime-error-modal";
+
+export default defineConfig({
+  plugins: [
+    react(),
+    runtimeErrorOverlay(),
+    ...(process.env.NODE_ENV !== "production" &&
+    process.env.REPL_ID !== undefined
+      ? [
+          await import("@replit/vite-plugin-cartographer").then((m) =>
+            m.cartographer(),
+          ),
+          await import("@replit/vite-plugin-dev-banner").then((m) =>
+            m.devBanner(),
+          ),
+        ]
+      : []),
+  ],
+  resolve: {
+    alias: {
+      "@": path.resolve(import.meta.dirname, "client", "src"),
+      "@shared": path.resolve(import.meta.dirname, "shared"),
+      "@assets": path.resolve(import.meta.dirname, "attached_assets"),
+    },
+  },
+  root: path.resolve(import.meta.dirname, "client"),
+  build: {
+    outDir: path.resolve(import.meta.dirname, "dist/public"),
+    emptyOutDir: true,
+  },
+  server: {
+    fs: {
+      strict: true,
+      deny: ["**/.*"],
+    },
+  },
+});
+
+========================================
+FILE: client/src/pages/home.tsx
+========================================
+
+import { useState, useEffect, useRef, useCallback } from "react";
+import { Card } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Badge } from "@/components/ui/badge";
+import { Progress } from "@/components/ui/progress";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Separator } from "@/components/ui/separator";
+import { useToast } from "@/hooks/use-toast";
+import { apiRequest } from "@/lib/queryClient";
+import {
+  Play,
+  Square,
+  Plus,
+  Trash2,
+  Globe,
+  MousePointerClick,
+  Type,
+  Clock,
+  ArrowDown,
+  ListChecks,
+  Repeat,
+  Terminal,
+  CheckCircle2,
+  XCircle,
+  AlertTriangle,
+  Info,
+  Loader2,
+  GripVertical,
+  Zap,
+  Settings2,
+  Camera,
+  Shield,
+} from "lucide-react";
+import type { Action, TaskConfig, TaskProgress, TaskLog, TaskStatus } from "@shared/schema";
+
+const actionTypeConfig = {
+  click: { label: "Click", icon: MousePointerClick, color: "text-blue-500", desc: "Click on an element" },
+  type: { label: "Type Text", icon: Type, color: "text-green-500", desc: "Type text into a field" },
+  wait: { label: "Wait", icon: Clock, color: "text-amber-500", desc: "Wait for seconds" },
+  scroll: { label: "Scroll", icon: ArrowDown, color: "text-purple-500", desc: "Scroll the page" },
+  select: { label: "Select Option", icon: ListChecks, color: "text-cyan-500", desc: "Select from dropdown" },
+  screenshot: { label: "Screenshot", icon: Camera, color: "text-pink-500", desc: "Take a screenshot" },
+};
+
+function generateId() {
+  return Math.random().toString(36).substring(2, 10);
+}
+
+function ActionCard({
+  action,
+  index,
+  onUpdate,
+  onRemove,
+}: {
+  action: Action;
+  index: number;
+  onUpdate: (id: string, updates: Partial<Action>) => void;
+  onRemove: (id: string) => void;
+}) {
+  const config = actionTypeConfig[action.type];
+  const Icon = config.icon;
+
+  return (
+    <div
+      className="group flex items-start gap-3 p-3 rounded-md bg-card border border-card-border transition-all duration-200"
+      data-testid={`action-card-${index}`}
+    >
+      <div className="flex items-center gap-2 pt-1">
+        <GripVertical className="w-4 h-4 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity cursor-grab" />
+        <div className={`p-1.5 rounded-md bg-muted ${config.color}`}>
+          <Icon className="w-4 h-4" />
+        </div>
+      </div>
+
+      <div className="flex-1 space-y-2 min-w-0">
+        <div className="flex items-center gap-2 flex-wrap">
+          <Badge variant="secondary" className="text-xs font-mono">
+            #{index + 1}
+          </Badge>
+          <span className="text-sm font-medium">{config.label}</span>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          {(action.type === "click" || action.type === "type" || action.type === "select") && (
+            <div>
+              <Label className="text-xs text-muted-foreground">CSS Selector</Label>
+              <Input
+                placeholder="e.g. #submit-btn, .my-class"
+                value={action.selector || ""}
+                onChange={(e) => onUpdate(action.id, { selector: e.target.value })}
+                className="h-8 text-sm font-mono"
+                data-testid={`input-selector-${index}`}
+              />
+            </div>
+          )}
+          {(action.type === "type" || action.type === "select") && (
+            <div>
+              <Label className="text-xs text-muted-foreground">
+                {action.type === "type" ? "Text to Type" : "Option Value"}
+              </Label>
+              <Input
+                placeholder={action.type === "type" ? "Enter text..." : "option value"}
+                value={action.value || ""}
+                onChange={(e) => onUpdate(action.id, { value: e.target.value })}
+                className="h-8 text-sm"
+                data-testid={`input-value-${index}`}
+              />
+            </div>
+          )}
+          {action.type === "wait" && (
+            <div>
+              <Label className="text-xs text-muted-foreground">Wait Time (ms)</Label>
+              <Input
+                type="number"
+                placeholder="1000"
+                value={action.value || ""}
+                onChange={(e) => onUpdate(action.id, { value: e.target.value })}
+                className="h-8 text-sm"
+                data-testid={`input-wait-${index}`}
+              />
+            </div>
+          )}
+          {action.type === "scroll" && (
+            <div>
+              <Label className="text-xs text-muted-foreground">Scroll Amount (px)</Label>
+              <Input
+                type="number"
+                placeholder="500"
+                value={action.value || ""}
+                onChange={(e) => onUpdate(action.id, { value: e.target.value })}
+                className="h-8 text-sm"
+                data-testid={`input-scroll-${index}`}
+              />
+            </div>
+          )}
+          <div className={action.type === "screenshot" ? "col-span-full" : ""}>
+            <Label className="text-xs text-muted-foreground">Description (optional)</Label>
+            <Input
+              placeholder="What does this step do?"
+              value={action.description || ""}
+              onChange={(e) => onUpdate(action.id, { description: e.target.value })}
+              className="h-8 text-sm"
+              data-testid={`input-desc-${index}`}
+            />
+          </div>
+        </div>
+      </div>
+
+      <Button
+        size="icon"
+        variant="ghost"
+        onClick={() => onRemove(action.id)}
+        className="text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity mt-1"
+        data-testid={`button-remove-action-${index}`}
+      >
+        <Trash2 className="w-4 h-4" />
+      </Button>
+    </div>
+  );
+}
+
+function LogEntry({ log }: { log: TaskLog }) {
+  const iconMap = {
+    info: <Info className="w-3.5 h-3.5 text-blue-400 shrink-0" />,
+    success: <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />,
+    error: <XCircle className="w-3.5 h-3.5 text-red-400 shrink-0" />,
+    warning: <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />,
+  };
+
+  const colorMap = {
+    info: "text-foreground/80",
+    success: "text-emerald-400",
+    error: "text-red-400",
+    warning: "text-amber-400",
+  };
+
+  return (
+    <div className="flex items-start gap-2 py-1 px-2 font-mono text-xs leading-relaxed" data-testid={`log-entry-${log.id}`}>
+      {iconMap[log.type]}
+      <span className="text-muted-foreground shrink-0">
+        {new Date(log.timestamp).toLocaleTimeString()}
+      </span>
+      {log.repetition !== undefined && (
+        <Badge variant="outline" className="text-[10px] px-1 py-0 h-4 shrink-0">
+          #{log.repetition}
+        </Badge>
+      )}
+      <span className={colorMap[log.type]}>{log.message}</span>
+    </div>
+  );
+}
+
+function StatusBadge({ status }: { status: TaskStatus }) {
+  const config: Record<TaskStatus, { label: string; variant: "default" | "secondary" | "destructive" | "outline" }> = {
+    idle: { label: "Ready", variant: "secondary" },
+    running: { label: "Running", variant: "default" },
+    paused: { label: "Paused", variant: "outline" },
+    completed: { label: "Completed", variant: "secondary" },
+    error: { label: "Error", variant: "destructive" },
+  };
+  const c = config[status];
+  return (
+    <Badge variant={c.variant} data-testid="badge-status">
+      {status === "running" && <Loader2 className="w-3 h-3 mr-1 animate-spin" />}
+      {c.label}
+    </Badge>
+  );
+}
+
+export default function Home() {
+  const { toast } = useToast();
+  const [url, setUrl] = useState("");
+  const [actions, setActions] = useState<Action[]>([]);
+  const [repetitions, setRepetitions] = useState(1);
+  const [delayBetweenReps, setDelayBetweenReps] = useState(1000);
+  const [proxyListUrl, setProxyListUrl] = useState("");
+  const [progress, setProgress] = useState<TaskProgress>({
+    status: "idle",
+    currentRepetition: 0,
+    totalRepetitions: 0,
+    logs: [],
+  });
+  const logsEndRef = useRef<HTMLDivElement>(null);
+  const pollingRef = useRef<NodeJS.Timeout | null>(null);
+
+  const addAction = (type: Action["type"]) => {
+    const newAction: Action = {
+      id: generateId(),
+      type,
+      selector: "",
+      value: type === "wait" ? "1000" : type === "scroll" ? "500" : "",
+      description: "",
+    };
+    setActions((prev) => [...prev, newAction]);
+  };
+
+  const updateAction = (id: string, updates: Partial<Action>) => {
+    setActions((prev) => prev.map((a) => (a.id === id ? { ...a, ...updates } : a)));
+  };
+
+  const removeAction = (id: string) => {
+    setActions((prev) => prev.filter((a) => a.id !== id));
+  };
+
+  const pollProgress = useCallback(async () => {
+    try {
+      const res = await fetch("/api/task/progress", { credentials: "include" });
+      if (res.ok) {
+        const data: TaskProgress = await res.json();
+        setProgress(data);
+        if (data.status === "completed" || data.status === "error") {
+          if (pollingRef.current) {
+            clearInterval(pollingRef.current);
+            pollingRef.current = null;
+          }
+        }
+      }
+    } catch {
+      // ignore polling errors
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (pollingRef.current) clearInterval(pollingRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (logsEndRef.current) {
+      logsEndRef.current.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [progress.logs.length]);
+
+  const startTask = async () => {
+    if (!url) {
+      toast({ title: "URL Required", description: "Please enter a valid URL", variant: "destructive" });
+      return;
+    }
+    if (actions.length === 0) {
+      toast({ title: "Actions Required", description: "Add at least one action", variant: "destructive" });
+      return;
+    }
+
+    for (const action of actions) {
+      if ((action.type === "click" || action.type === "type" || action.type === "select") && !action.selector?.trim()) {
+        toast({ title: "Missing Selector", description: `Action "${action.type}" (step #${actions.indexOf(action) + 1}) requires a CSS selector`, variant: "destructive" });
+        return;
+      }
+      if ((action.type === "type" || action.type === "select") && !action.value?.trim()) {
+        toast({ title: "Missing Value", description: `Action "${action.type}" (step #${actions.indexOf(action) + 1}) requires a value`, variant: "destructive" });
+        return;
+      }
+    }
+
+    try {
+      const config: TaskConfig = {
+        url,
+        actions,
+        repetitions,
+        delayBetweenReps,
+        proxyListUrl: proxyListUrl.trim() || undefined,
+      };
+      await apiRequest("POST", "/api/task/start", config);
+      toast({ title: "Task Started", description: `Running ${repetitions} repetition(s)` });
+      
+      if (pollingRef.current) clearInterval(pollingRef.current);
+      pollingRef.current = setInterval(pollProgress, 500);
+      pollProgress();
+    } catch (err: any) {
+      toast({ title: "Failed to Start", description: err.message, variant: "destructive" });
+    }
+  };
+
+  const stopTask = async () => {
+    try {
+      await apiRequest("POST", "/api/task/stop");
+      toast({ title: "Task Stopped" });
+      if (pollingRef.current) {
+        clearInterval(pollingRef.current);
+        pollingRef.current = null;
+      }
+      pollProgress();
+    } catch (err: any) {
+      toast({ title: "Failed to Stop", description: err.message, variant: "destructive" });
+    }
+  };
+
+  const progressPercent =
+    progress.totalRepetitions > 0
+      ? (progress.currentRepetition / progress.totalRepetitions) * 100
+      : 0;
+
+  const isRunning = progress.status === "running";
+
+  return (
+    <div className="min-h-screen bg-background">
+      <div className="max-w-5xl mx-auto px-4 py-6 space-y-6">
+        {/* Header */}
+        <div className="flex items-center gap-3">
+          <div className="p-2 rounded-md bg-primary/10">
+            <Zap className="w-6 h-6 text-primary" />
+          </div>
+          <div>
+            <h1 className="text-2xl font-bold tracking-tight" data-testid="text-title">
+              Browser Automator
+            </h1>
+            <p className="text-sm text-muted-foreground">
+              Automate browser actions with headless Chrome
+            </p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
+          {/* Left Panel - Configuration */}
+          <div className="lg:col-span-3 space-y-4">
+            {/* URL Input */}
+            <Card className="p-4 space-y-3">
+              <div className="flex items-center gap-2">
+                <Globe className="w-4 h-4 text-primary" />
+                <Label className="text-sm font-semibold">Target URL</Label>
+              </div>
+              <Input
+                placeholder="https://example.com"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                className="font-mono text-sm"
+                disabled={isRunning}
+                data-testid="input-url"
+              />
+            </Card>
+
+            {/* Settings Row */}
+            <Card className="p-4">
+              <div className="flex items-center gap-2 mb-3">
+                <Settings2 className="w-4 h-4 text-primary" />
+                <Label className="text-sm font-semibold">Settings</Label>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <Label className="text-xs text-muted-foreground">Repetitions</Label>
+                  <div className="flex items-center gap-2 mt-1">
+                    <Repeat className="w-4 h-4 text-muted-foreground" />
+                    <Input
+                      type="number"
+                      min={1}
+                      max={1000}
+                      value={repetitions}
+                      onChange={(e) => setRepetitions(Math.max(1, parseInt(e.target.value) || 1))}
+                      className="h-8 text-sm"
+                      disabled={isRunning}
+                      data-testid="input-repetitions"
+                    />
+                  </div>
+                </div>
+                <div>
+                  <Label className="text-xs text-muted-foreground">Delay between reps (ms)</Label>
+                  <div className="flex items-center gap-2 mt-1">
+                    <Clock className="w-4 h-4 text-muted-foreground" />
+                    <Input
+                      type="number"
+                      min={0}
+                      max={300000}
+                      step={500}
+                      value={delayBetweenReps}
+                      onChange={(e) => setDelayBetweenReps(Math.max(0, parseInt(e.target.value) || 0))}
+                      className="h-8 text-sm"
+                      disabled={isRunning}
+                      data-testid="input-delay"
+                    />
+                  </div>
+                </div>
+              </div>
+            </Card>
+
+            {/* Proxy */}
+            <Card className="p-4 space-y-3">
+              <div className="flex items-center gap-2">
+                <Shield className="w-4 h-4 text-primary" />
+                <Label className="text-sm font-semibold">Proxy (IP Rotation)</Label>
+                <Badge variant="outline" className="text-xs">
+                  {proxyListUrl ? "Active" : "Off"}
+                </Badge>
+              </div>
+              <Input
+                placeholder="Paste your Webshare proxy list URL here..."
+                value={proxyListUrl}
+                onChange={(e) => setProxyListUrl(e.target.value)}
+                className="font-mono text-xs"
+                disabled={isRunning}
+                data-testid="input-proxy-url"
+              />
+              <p className="text-xs text-muted-foreground">
+                Each repetition will use a different proxy IP to avoid detection. Get free proxies from webshare.io
+              </p>
+            </Card>
+
+            {/* Actions */}
+            <Card className="p-4 space-y-3">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div className="flex items-center gap-2">
+                  <ListChecks className="w-4 h-4 text-primary" />
+                  <Label className="text-sm font-semibold">Actions</Label>
+                  <Badge variant="outline" className="text-xs">
+                    {actions.length}
+                  </Badge>
+                </div>
+              </div>
+
+              {/* Add action buttons */}
+              <div className="flex flex-wrap gap-2">
+                {(Object.entries(actionTypeConfig) as [Action["type"], typeof actionTypeConfig.click][]).map(
+                  ([type, config]) => {
+                    const Icon = config.icon;
+                    return (
+                      <Button
+                        key={type}
+                        variant="outline"
+                        size="sm"
+                        onClick={() => addAction(type)}
+                        disabled={isRunning}
+                        data-testid={`button-add-${type}`}
+                      >
+                        <Icon className={`w-3.5 h-3.5 mr-1.5 ${config.color}`} />
+                        {config.label}
+                      </Button>
+                    );
+                  }
+                )}
+              </div>
+
+              <Separator />
+
+              {/* Action list */}
+              {actions.length === 0 ? (
+                <div className="py-8 text-center text-muted-foreground" data-testid="text-empty-actions">
+                  <Plus className="w-8 h-8 mx-auto mb-2 opacity-40" />
+                  <p className="text-sm">No actions yet. Add actions above to build your automation.</p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {actions.map((action, i) => (
+                    <ActionCard
+                      key={action.id}
+                      action={action}
+                      index={i}
+                      onUpdate={updateAction}
+                      onRemove={removeAction}
+                    />
+                  ))}
+                </div>
+              )}
+            </Card>
+
+            {/* Start/Stop */}
+            <div className="flex gap-3">
+              {!isRunning ? (
+                <Button
+                  onClick={startTask}
+                  disabled={actions.length === 0 || !url}
+                  className="flex-1"
+                  data-testid="button-start"
+                >
+                  <Play className="w-4 h-4 mr-2" />
+                  Start Automation
+                </Button>
+              ) : (
+                <Button
+                  variant="destructive"
+                  onClick={stopTask}
+                  className="flex-1"
+                  data-testid="button-stop"
+                >
+                  <Square className="w-4 h-4 mr-2" />
+                  Stop
+                </Button>
+              )}
+            </div>
+          </div>
+
+          {/* Right Panel - Progress & Logs */}
+          <div className="lg:col-span-2 space-y-4">
+            {/* Progress */}
+            <Card className="p-4 space-y-3">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <Label className="text-sm font-semibold">Progress</Label>
+                <StatusBadge status={progress.status} />
+              </div>
+
+              <Progress value={progressPercent} className="h-2" data-testid="progress-bar" />
+
+              <div className="flex items-center justify-between text-xs text-muted-foreground">
+                <span data-testid="text-progress">
+                  {progress.currentRepetition} / {progress.totalRepetitions} repetitions
+                </span>
+                <span>{Math.round(progressPercent)}%</span>
+              </div>
+
+              {progress.startedAt && (
+                <div className="text-xs text-muted-foreground">
+                  Started: {new Date(progress.startedAt).toLocaleTimeString()}
+                </div>
+              )}
+              {progress.completedAt && (
+                <div className="text-xs text-muted-foreground">
+                  Completed: {new Date(progress.completedAt).toLocaleTimeString()}
+                </div>
+              )}
+              {progress.error && (
+                <div className="text-xs text-red-400 bg-red-500/10 p-2 rounded-md" data-testid="text-error">
+                  {progress.error}
+                </div>
+              )}
+            </Card>
+
+            {/* Logs */}
+            <Card className="p-4 space-y-3">
+              <div className="flex items-center gap-2">
+                <Terminal className="w-4 h-4 text-primary" />
+                <Label className="text-sm font-semibold">Logs</Label>
+                <Badge variant="outline" className="text-xs">
+                  {progress.logs.length}
+                </Badge>
+              </div>
+
+              <div className="bg-muted/50 rounded-md border border-border">
+                <ScrollArea className="h-[400px]" data-testid="logs-scroll">
+                  {progress.logs.length === 0 ? (
+                    <div className="flex items-center justify-center h-full text-muted-foreground text-sm py-16">
+                      Logs will appear here...
+                    </div>
+                  ) : (
+                    <div className="py-1">
+                      {progress.logs.map((log) => (
+                        <LogEntry key={log.id} log={log} />
+                      ))}
+                      <div ref={logsEndRef} />
+                    </div>
+                  )}
+                </ScrollArea>
+              </div>
+            </Card>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+========================================
+FILE: client/src/App.tsx
+========================================
+
+import { Switch, Route } from "wouter";
+import { queryClient } from "./lib/queryClient";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { Toaster } from "@/components/ui/toaster";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import NotFound from "@/pages/not-found";
+import Home from "@/pages/home";
+
+function Router() {
+  return (
+    <Switch>
+      <Route path="/" component={Home} />
+      <Route component={NotFound} />
+    </Switch>
+  );
+}
+
+function App() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <TooltipProvider>
+        <Toaster />
+        <Router />
+      </TooltipProvider>
+    </QueryClientProvider>
+  );
+}
+
+export default App;
+
+========================================
+FILE: client/src/main.tsx
+========================================
+
+import { createRoot } from "react-dom/client";
+import App from "./App";
+import "./index.css";
+
+createRoot(document.getElementById("root")!).render(<App />);
+
+========================================
+FILE: client/src/lib/queryClient.ts
+========================================
+
+import { QueryClient, QueryFunction } from "@tanstack/react-query";
+
+async function throwIfResNotOk(res: Response) {
+  if (!res.ok) {
+    const text = (await res.text()) || res.statusText;
+    throw new Error(`${res.status}: ${text}`);
+  }
+}
+
+export async function apiRequest(
+  method: string,
+  url: string,
+  data?: unknown | undefined,
+): Promise<Response> {
+  const res = await fetch(url, {
+    method,
+    headers: data ? { "Content-Type": "application/json" } : {},
+    body: data ? JSON.stringify(data) : undefined,
+    credentials: "include",
+  });
+
+  await throwIfResNotOk(res);
+  return res;
+}
+
+type UnauthorizedBehavior = "returnNull" | "throw";
+export const getQueryFn: <T>(options: {
+  on401: UnauthorizedBehavior;
+}) => QueryFunction<T> =
+  ({ on401: unauthorizedBehavior }) =>
+  async ({ queryKey }) => {
+    const res = await fetch(queryKey.join("/") as string, {
+      credentials: "include",
+    });
+
+    if (unauthorizedBehavior === "returnNull" && res.status === 401) {
+      return null;
+    }
+
+    await throwIfResNotOk(res);
+    return await res.json();
+  };
+
+export const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      queryFn: getQueryFn({ on401: "throw" }),
+      refetchInterval: false,
+      refetchOnWindowFocus: false,
+      staleTime: Infinity,
+      retry: false,
+    },
+    mutations: {
+      retry: false,
+    },
+  },
+});
